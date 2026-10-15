@@ -1,0 +1,94 @@
+# syntax=docker/dockerfile:1
+#
+# Strata on an Intel Arc (the SYCL port in sycl/): one container, no nested Docker.
+#
+# The root Dockerfile is CUDA-only (FROM nvidia/cuda, -DSTRATA_ENABLE_CUDA=ON). This one builds the
+# SYCL engine at image build time on top of the oneAPI dev image, so the first container start only
+# downloads the model and runs setup - the same shape as the CUDA image, pointed at the Intel path.
+#
+# Build (two stages; stage A is upstream's, unchanged):
+#   docker build -t strata-sycl-dev sycl/tools                  # oneAPI 2026.1 + oneMKL + Level Zero, ~6 min / ~13 GB
+#   docker build -f Dockerfile.b70 -t strata-b70 .              # Arc Pro B70 (AOT bmg-g31, the default)
+#   docker build -f Dockerfile.b70 --build-arg AOT=bmg-g21 -t strata-b70-b60 .   # B580 / B570 / Pro B60
+#   docker build -f Dockerfile.b70 --build-arg AOT= -t strata-b70-jit .          # A-series / unknown card: JIT
+#
+# Run (host needs Intel's xe/i915 driver + compute runtime, docs/INTEL_ARC.md "What you need"):
+#   docker run -d --name strata-b70 --device /dev/dri --ulimit memlock=-1 \
+#     --stop-timeout 60 --oom-score-adj 1000 -p 8080:8080 \
+#     -v strata-b70-data:/work/data \
+#     -e MODEL=IQ2_XS -e CONTEXT=32768 -e HOST=0.0.0.0 -e API_KEY=<secret> \
+#     strata-b70
+#
+# Setup choices are env vars, read by docker-entrypoint-sycl.sh: FAMILY, MODEL, CONTEXT, KV, HOST,
+# PORT, API_KEY, GGUF_DIR, MODELS_DIR, REINSTALL, CONFIG, VRAM_RESERVE_MIB, DRAFT_VOCAB, GPU, GPUS,
+# LAYER_SPLIT, KV_STREAMING. Engine switches (STRATA_*, ONEAPI_*, UR_*, IGC_*, SYCL_*, ZES_*) pass
+# straight to the engine. The model files, pack, MTP layer and config live on the /work/data volume;
+# the engine is part of the image. Add an API key before exposing the port to a network.
+#
+# NOTE: unverified on an Arc - the maintainers have no Intel GPU. Fail fast with the probes in
+# INTEL_B70_DOCKER_PLAN.md (sycl-ls, ocloc ids, setup.py --backend sycl --check) before a first start.
+
+FROM strata-sycl-dev
+
+# The three the port's own start script pins (sycl/serve/strata-sycl.sh, docs/INTEL.md "Things that
+# matter on this GPU"), plus the device-built verify plan. The config's "env" block (child_env in
+# serve/server.py) overrides these per card - e.g. an i915 Alchemist sets STRATA_VERIFY_NO_HOST=0.
+ENV DEBIAN_FRONTEND=noninteractive PYTHONUNBUFFERED=1 LANG=C.UTF-8 \
+    ONEAPI_DEVICE_SELECTOR=level_zero:0 SYCL_CACHE_PERSISTENT=0 ZES_ENABLE_SYSMAN=1 \
+    STRATA_VERIFY_DEVICE_PLAN=1 STRATA_VERIFY_NO_HOST=1 STRATA_STAGER_THREADS=12
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential ca-certificates curl git libatomic1 libgomp1 \
+        python3 python3-pip python3-venv unzip rsync \
+    && rm -rf /var/lib/apt/lists/*
+
+# /work is what sycl/serve/strata-sycl.sh mounts at the host. Keeping the repo one level under it makes
+# every path setup writes (/work/strata/..., /work/data/...) valid inside the container as-is:
+# sycl/setup_intel.py's sycl_path() maps the folder above the checkout onto /work/ and hard-fails on
+# anything outside it, so the data dir must sit under /work too.
+WORKDIR /work/strata
+COPY . .
+
+RUN python3 -m venv .venv \
+    && .venv/bin/pip install --no-cache-dir --upgrade pip \
+    && .venv/bin/pip install --no-cache-dir -r requirements.txt \
+    && chmod +x setup.sh docker-entrypoint-sycl.sh sycl/serve/strata-native.sh
+
+# The engine, ahead-of-time for the card. -S sycl (not -S .) so the binary lands at build-sycl-aot/strata,
+# the first path sycl/setup_intel.py's sycl_engine() looks for (it accepts only build-sycl-aot/strata or
+# build-sycl/strata - which is why the build tree is kept, unlike the CUDA image that deletes its cmake
+# trees). The flags are sycl/tools/build.sh's: -fp-model=precise and
+# -cl-fp32-correctly-rounded-divide-sqrt are load-bearing (docs/INTEL.md "How it was made").
+# STRATA_SYCL_PARITY=OFF skips the ~157 kernel-test targets (build them on and ctest --test-dir
+# build-sycl-aot on the card to run them).
+#
+# Needs network: sycl/CMakeLists.txt FetchContents llama.cpp at the pinned commit (STRATA_GGML_DIR is
+# empty), and .dockerignore keeps third_party/ and any host build out of the image. Build it on the PC it
+# runs on: GGML_NATIVE is forced ON, so ggml-cpu is compiled for the build host's CPU.
+ARG AOT=bmg-g31
+ARG JOBS=12
+RUN set +u; . /opt/intel/oneapi/setvars.sh >/dev/null 2>&1; set -u; \
+    if [ -n "$AOT" ] && ! command -v ocloc >/dev/null 2>&1; then \
+      echo "AOT=$AOT needs ocloc (the intel-ocloc package). Rebuild with --build-arg AOT= for a JIT build." >&2; exit 1; \
+    fi; \
+    cmake -S /work/strata/sycl -B /work/strata/build-sycl-aot -G Ninja \
+          -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icpx \
+          -DSTRATA_SYCL_AOT="$AOT" -DSTRATA_SYCL_PARITY=OFF \
+    && cmake --build /work/strata/build-sycl-aot -j "$JOBS" --target strata -- -k 0 \
+    && test -x /work/strata/build-sycl-aot/strata
+
+# The fetched llama.cpp is compiled statically into the engine; _deps is not needed at run time. (A full
+# re-configure in the container would re-fetch it.) Prune more of build-sycl-aot/ if image size matters,
+# but keep the strata binary and build.ninja.
+RUN rm -rf /work/strata/build-sycl-aot/_deps
+
+VOLUME ["/work/data"]
+EXPOSE 8080
+
+# /health answers 503 while the model loads (docs/INTEL.md); a 30 GB model loads in ~2 min and a first
+# start also downloads ~70 GB, so the start period is generous: a short one marks a still-loading
+# container unhealthy and a restart policy kills it mid-download (the CUDA Dockerfile's reasoning).
+HEALTHCHECK --interval=30s --timeout=5s --start-period=600s --retries=3 \
+  CMD curl -fs "http://127.0.0.1:${PORT:-8080}/health" || exit 1
+
+ENTRYPOINT ["./docker-entrypoint-sycl.sh"]
